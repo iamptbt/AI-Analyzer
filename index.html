@@ -100,15 +100,20 @@
                     </div>`;
 
                 try {
-                    // 2. Fetch data from our secure serverless function
-                    // This function calls the Shopify API so our keys are not exposed in the browser.
-                    // FIX: Use a full URL by combining window.location.origin with the relative path.
-                    const apiUrl = `${window.location.origin}/api/analytics?metrics=orders`;
-                    const response = await fetch(apiUrl);
+                    // 2. Fetch data from our secure serverless function.
+                    // FIX: Using the full, absolute URL to your deployed function.
+                    const functionUrl = `https://admirable-tulumba-98b343.netlify.app/.netlify/functions/analytics`;
+                    const response = await fetch(functionUrl);
+                    
                     if (!response.ok) {
                         throw new Error(`Failed to fetch Shopify data. Server responded with ${response.status}.`);
                     }
                     const shopifyData = await response.json();
+
+                    // Check if the server-side function returned an error
+                    if (shopifyData.error) {
+                        throw new Error(shopifyData.error);
+                    }
 
                     // 3. Call Gemini AI for analysis
                     const aiInsights = await getAiAnalysis(shopifyData.orders);
@@ -197,3 +202,4 @@
     </script>
 </body>
 </html>
+
