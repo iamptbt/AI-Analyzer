@@ -18,6 +18,10 @@ exports.handler = async (event, context) => {
     };
   }
 
+  // --- FIX: Sanitize the domain to prevent double "https://" ---
+  // This removes any "http://" or "https://" prefix from the start of the domain.
+  const sanitizedDomain = SHOPIFY_STORE_DOMAIN.replace(/^(https?:\/\/)/, '');
+
   // Calculate dates for the last 30 days
   const endDate = new Date();
   const startDate = new Date();
@@ -35,7 +39,8 @@ exports.handler = async (event, context) => {
       limit: 250 // Fetch up to 250 recent orders
   });
   
-  const apiUrl = `https://${SHOPIFY_STORE_DOMAIN}/admin/api/${apiVersion}/${resource}.json?${queryParams.toString()}`;
+  // Use the sanitizedDomain to build the correct URL
+  const apiUrl = `https://${sanitizedDomain}/admin/api/${apiVersion}/${resource}.json?${queryParams.toString()}`;
 
   // --- API Request to Shopify ---
   try {
