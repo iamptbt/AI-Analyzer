@@ -1,58 +1,59 @@
 // functions/analytics.js
 
-// This function now handles various report types and date ranges.
-// It fetches the appropriate data from Shopify and generates a custom
-// prompt for the Gemini AI to provide specific insights.
+// This upgraded function handles two types of requests:
+// 1. GET: To fetch a report and get an initial AI analysis.
+// 2. POST: To answer a user's follow-up question about the fetched data.
 
 const fetch = require('node-fetch');
 
 // --- Main Serverless Function Handler ---
 exports.handler = async (event, context) => {
-  // Get secrets from Netlify environment variables
-  const {
-    SHOPIFY_STORE_DOMAIN,
-    SHOPIFY_ACCESS_TOKEN,
-    GEMINI_API_KEY
-  } = process.env;
+  const { SHOPIFY_STORE_DOMAIN, SHOPIFY_ACCESS_TOKEN, GEMINI_API_KEY } = process.env;
 
-  // --- Security and Input Validation ---
+  // --- Security and Configuration Validation ---
   if (!SHOPIFY_STORE_DOMAIN || !SHOPIFY_ACCESS_TOKEN || !GEMINI_API_KEY) {
     const missingKeys = [
         !SHOPIFY_STORE_DOMAIN && "SHOPIFY_STORE_DOMAIN",
         !SHOPIFY_ACCESS_TOKEN && "SHOPIFY_ACCESS_TOKEN",
         !GEMINI_API_KEY && "GEMINI_API_KEY"
     ].filter(Boolean).join(', ');
-
-    return {
-      statusCode: 500,
-      body: JSON.stringify({ error: `The following required environment variables are not configured on the server: ${missingKeys}` }),
-    };
+    return { statusCode: 500, body: JSON.stringify({ error: `Server configuration error. Missing keys: ${missingKeys}` }) };
   }
 
-  // --- Get Parameters from Front-End Request ---
-  const reportType = event.queryStringParameters.report || 'orders';
-  const days = parseInt(event.queryStringParameters.days, 10) || 30;
-
-  try {
-    // --- Step 1: Fetch Data from Shopify based on report type ---
-    const shopifyData = await fetchFromShopify(SHOPIFY_STORE_DOMAIN, SHOPIFY_ACCESS_TOKEN, reportType, days);
-
-    // --- Step 2: Get Analysis from Gemini AI ---
-    const aiAnalysis = await getAiAnalysis(shopifyData, reportType, GEMINI_API_KEY);
-    
-    // --- Step 3: Return the AI's analysis to the front-end ---
-    return {
-      statusCode: 200,
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ analysis: aiAnalysis }),
-    };
-
-  } catch (error) {
-    console.error("Handler Error:", error);
-    return {
-      statusCode: 500,
-      body: JSON.stringify({ error: error.message })
-    };
+  // --- Route based on HTTP Method ---
+  if (event.httpMethod === 'POST') {
+    // Handle follow-up questions from the AI Chat
+    try {
+      const body = JSON.parse(event.body);
+      const { question, reportData, reportType } = body;
+      if (!question || !reportData || !reportType) {
+        return { statusCode: 400, body: JSON.stringify({ error: "Missing question or report data for chat." }) };
+      }
+      const chatAnswer = await getChatAnswer(question, reportData, reportType, GEMINI_API_KEY);
+      return { statusCode: 200, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ answer: chatAnswer }) };
+    } catch (error) {
+      console.error("Chat Handler Error:", error);
+      return { statusCode: 500, body: JSON.stringify({ error: error.message }) };
+    }
+  } else {
+    // Handle initial report fetching (GET request)
+    try {
+      const reportType = event.queryStringParameters.report || 'orders';
+      const days = parseInt(event.queryStringParameters.days, 10) || 30;
+      
+      const shopifyData = await fetchFromShopify(SHOPIFY_STORE_DOMAIN, SHOPIFY_ACCESS_TOKEN, reportType, days);
+      const initialAnalysis = await getInitialAnalysis(shopifyData, reportType, GEMINI_API_KEY);
+      
+      // IMPORTANT: Return BOTH the raw data and the AI analysis
+      return {
+        statusCode: 200,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ shopifyData: shopifyData, analysis: initialAnalysis }),
+      };
+    } catch (error) {
+      console.error("Report Fetch Error:", error);
+      return { statusCode: 500, body: JSON.stringify({ error: error.message }) };
+    }
   }
 };
 
@@ -67,9 +68,8 @@ async function fetchFromShopify(storeDomain, accessToken, reportType, days) {
 
   const apiVersion = '2024-07';
   let resource;
-  let queryParams = new URLSearchParams({ limit: 250 }); // Default limit
+  let queryParams = new URLSearchParams({ limit: 250 });
 
-  // Time-based reports use date range
   const timeBasedReports = ['orders', 'draft_orders', 'fulfillments', 'marketing_events'];
   if (timeBasedReports.includes(reportType)) {
       queryParams.set('status', 'any');
@@ -77,7 +77,6 @@ async function fetchFromShopify(storeDomain, accessToken, reportType, days) {
       queryParams.set('created_at_max', formatDate(endDate));
   }
   
-  // Set the resource based on the report type
   switch (reportType) {
     case 'products': resource = 'products'; break;
     case 'customers': resource = 'customers'; break;
@@ -90,8 +89,8 @@ async function fetchFromShopify(storeDomain, accessToken, reportType, days) {
     case 'script_tags': resource = 'script_tags'; break;
     case 'shipping_zones': resource = 'shipping_zones'; break;
     case 'companies': resource = 'companies'; break;
-    case 'discounts': resource = 'price_rules'; break; // Discounts are called Price Rules in the API
-    case 'inventory_levels': resource = 'inventory_levels'; break; // Note: This requires inventory_item_ids
+    case 'discounts': resource = 'price_rules'; break;
+    case 'inventory_levels': resource = 'inventory_levels'; break;
     case 'orders': default: resource = 'orders'; break;
   }
   
@@ -105,15 +104,25 @@ async function fetchFromShopify(storeDomain, accessToken, reportType, days) {
   if (!response.ok) {
     const errorText = await response.text();
     console.error(`Shopify API Error for ${reportType}:`, errorText);
-    throw new Error(`Shopify API request failed for report type '${reportType}' with status: ${response.status}. Please check your app permissions.`);
+    throw new Error(`Shopify API request failed for report type '${reportType}' with status: ${response.status}.`);
   }
   return response.json();
 }
 
+// --- Helper for Initial AI Analysis ---
+async function getInitialAnalysis(data, reportType, apiKey) {
+  const prompt = generateInitialPrompt(data, reportType);
+  return callGemini(prompt, apiKey);
+}
 
-// --- Helper Function to Call Gemini AI ---
-async function getAiAnalysis(data, reportType, apiKey) {
-  const prompt = generateAiPrompt(data, reportType);
+// --- Helper for AI Chat Follow-ups ---
+async function getChatAnswer(question, reportData, reportType, apiKey) {
+    const prompt = generateChatPrompt(question, reportData, reportType);
+    return callGemini(prompt, apiKey);
+}
+
+// --- Unified Gemini API Caller ---
+async function callGemini(prompt, apiKey) {
   const geminiApiUrl = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
   const payload = { contents: [{ role: "user", parts: [{ text: prompt }] }] };
 
@@ -138,43 +147,23 @@ async function getAiAnalysis(data, reportType, apiKey) {
 }
 
 // --- Prompt Generation Logic ---
-function generateAiPrompt(data, reportType) {
-    const basePrompt = `You are an expert e-commerce data analyst for a Shopify store. Based on the following raw JSON data, provide a concise summary of actionable insights. Present your findings in clear Markdown format. Use headings, bold text, and bullet points.`;
-    let specificPrompt = '';
-    let jsonData = JSON.stringify(data[Object.keys(data)[0]], null, 2); // Get the data from the first key (e.g., data.orders)
+function generateInitialPrompt(data, reportType) {
+    const basePrompt = `You are an expert e-commerce data analyst. Based on the following raw JSON data from a Shopify store, provide a concise summary of actionable insights. Identify the top 3 most important highlights or anomalies. Present your findings in clear Markdown format. Use headings, bold text, and bullet points.`;
+    let specificContext = '';
+    let jsonData = JSON.stringify(data[Object.keys(data)[0]], null, 2);
 
     switch (reportType) {
-        case 'products':
-            specificPrompt = `The data contains a list of products. Analyze inventory levels, product types, and vendor information to identify top sellers, potential stock issues, and opportunities for product bundling or marketing.`;
-            break;
-        case 'customers':
-            specificPrompt = `The data contains a list of customers. Analyze their order counts, total spending, and location to identify high-value customers, repeat buyers, and potential geographic markets for targeted campaigns.`;
-            break;
-        case 'discounts':
-            specificPrompt = `The data contains a list of discount codes (Price Rules). Analyze their usage, the types of discounts offered (e.g., percentage, fixed amount), and target selections to evaluate the effectiveness of promotional strategies.`;
-            break;
-        case 'fulfillments':
-            specificPrompt = `The data contains a list of fulfillments. Analyze the time-to-fulfill (time between creation and update), fulfillment services used, and tracking information to identify bottlenecks or inefficiencies in the shipping process.`;
-            break;
-        case 'locations':
-            specificPrompt = `The data contains a list of store locations. Analyze whether they are active and have inventory. Provide insights on inventory distribution if possible.`;
-            break;
-        case 'themes':
-            specificPrompt = `The data contains a list of installed themes. Identify the currently published theme ('role: "main"'). Comment on the number of unpublished themes and suggest best practices for theme management.`;
-            break;
-        case 'pages':
-            specificPrompt = `The data contains a list of content pages. Analyze the titles and publication status. Suggest opportunities for new content (like FAQs, About Us) or improving existing pages for SEO.`;
-            break;
-        case 'shipping_zones':
-            specificPrompt = `The data contains shipping zones and rates. Analyze the different zones, countries, and shipping price points. Identify if there are opportunities to offer better shipping rates or if any zones seem overly complex.`;
-            break;
-        case 'inventory_levels':
-            specificPrompt = `The data contains inventory levels. This is raw data linking inventory item IDs to locations. Summarize which locations have inventory and point out any items that might be low on stock across all locations.`;
-            break;
-        case 'orders':
-        default:
-            specificPrompt = `The data contains a list of orders. Analyze sales trends, average order value (AOV), top sales channels, and payment methods to provide a comprehensive overview of sales performance.`;
-            break;
+        case 'orders': specificContext = `Focus on sales trends, average order value (AOV), and any unusual sales patterns.`; break;
+        case 'products': specificContext = `Focus on top-selling products, inventory levels for popular items, and product categorization.`; break;
+        case 'customers': specificContext = `Focus on identifying high-value customers, repeat purchase rates, and customer lifetime value.`; break;
+        default: specificContext = `Provide a general analysis of the provided data.`; break;
     }
-    return `${basePrompt}\n\n${specificPrompt}\n\nHere is the data:\n${jsonData}`;
+    return `${basePrompt}\n\nContext: ${specificContext}\n\nHere is the data:\n${jsonData}`;
+}
+
+function generateChatPrompt(question, reportData, reportType) {
+    const basePrompt = `You are an expert e-commerce data analyst acting as a Q&A assistant. Your ONLY source of information is the JSON data provided below. Do not use outside knowledge or make assumptions. If the answer cannot be found in the data, you MUST say "I cannot answer that question with the provided data." Answer the user's question based on the data.`;
+    let jsonData = JSON.stringify(reportData, null, 2);
+    
+    return `${basePrompt}\n\nDATA TYPE: ${reportType} report\n\nUSER QUESTION: "${question}"\n\nJSON DATA:\n${jsonData}`;
 }
